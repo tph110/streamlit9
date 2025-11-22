@@ -6,179 +6,284 @@ import timm
 from torchvision import transforms
 import os
 import requests
-import numpy as np
 
 # --- CONFIGURATION ---
-# The URL to your model file on Hugging Face
 MODEL_URL = "https://huggingface.co/Skindoc/streamlit9/resolve/main/best_model_20251122_103707.pth"
-# Local path to save the model after download
 LOCAL_MODEL_PATH = "best_model_20251122_103707.pth"
 
-# Class names must match your training exactly
 CLASS_NAMES = ['akiec', 'bcc', 'bkl', 'df', 'mel', 'nv', 'scc', 'vasc']
 
-# SAFETY THRESHOLDS (Calibrated)
-THRESHOLDS = {
-    'mel': 0.1362,  # >13.6% probability -> Flag as Melanoma
-    'scc': 0.0003   # >0.03% probability -> Flag as SCC
+# Friendly display names for each class
+FRIENDLY_NAMES = {
+    'akiec': 'Actinic Keratosis (Pre-cancerous)',
+    'bcc': 'Basal Cell Carcinoma',
+    'bkl': 'Benign Keratosis',
+    'df': 'Dermatofibroma',
+    'mel': 'Melanoma',
+    'nv': 'Melanocytic Nevus (Common Mole)',
+    'scc': 'Squamous Cell Carcinoma',
+    'vasc': 'Vascular Lesion'
 }
 
-# --- HELPER FUNCTIONS ---
+# Risk categories for each class
+RISK_CATEGORIES = {
+    'mel': 'HIGH',
+    'scc': 'HIGH', 
+    'bcc': 'MEDIUM',
+    'akiec': 'MEDIUM',
+    'bkl': 'LOW',
+    'df': 'LOW',
+    'nv': 'LOW',
+    'vasc': 'LOW'
+}
 
-def download_model(url, save_path):
-    """Downloads the model file if it doesn't exist locally (Crucial for Deployment)."""
-    if not os.path.exists(save_path):
-        with st.spinner(f"Downloading model from Hugging Face... (This happens only once)"):
-            try:
-                # Use a temporary directory for robustness on cloud platforms
-                if 'STREAMLIT_SERVER_SESSION_ID' in os.environ:
-                    # Use the current directory if it's Streamlit Cloud
-                    pass
-                
-                response = requests.get(url, stream=True)
-                response.raise_for_status()
-                with open(save_path, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        f.write(chunk)
-                st.success("Model downloaded successfully!")
-            except Exception as e:
-                st.error(f"Failed to download model: {e}")
-                st.stop()
-    return save_path
+# Safety thresholds - flag these even if not the top prediction
+SAFETY_THRESHOLDS = {
+    'mel': 0.1362,   # Flag melanoma if probability > 13.6%
+    'scc': 0.0003    # Flag SCC if probability > 0.03%
+}
+
 
 @st.cache_resource
-def load_model(path):
-    """Loads the model into memory and caches it."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def load_model():
+    """Downloads model if needed and loads it into memory."""
+    device = torch.device("cpu")
     
-    # Create the empty architecture
-    model = timm.create_model("tf_efficientnet_b4", pretrained=False, num_classes=len(CLASS_NAMES))
+    # Download model if not present locally
+    if not os.path.exists(LOCAL_MODEL_PATH):
+        st.info("📥 Downloading model (first time only)...")
+        try:
+            response = requests.get(MODEL_URL, stream=True, timeout=300)
+            response.raise_for_status()
+            
+            with open(LOCAL_MODEL_PATH, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        except requests.RequestException as e:
+            st.error(f"Failed to download model: {e}")
+            return None, None
     
-    # Load weights
+    # Load the model
     try:
-        checkpoint = torch.load(path, map_location=device)
+        model = timm.create_model(
+            "tf_efficientnet_b4", 
+            pretrained=False, 
+            num_classes=len(CLASS_NAMES)
+        )
+        
+        checkpoint = torch.load(LOCAL_MODEL_PATH, map_location=device, weights_only=False)
+        
+        # Handle different checkpoint formats
         if "model_state_dict" in checkpoint:
             state_dict = checkpoint["model_state_dict"]
         else:
             state_dict = checkpoint
             
         model.load_state_dict(state_dict)
-    except Exception as e:
-        st.error(f"Error loading model weights: {e}")
-        st.stop()
+        model.to(device)
+        model.eval()
         
-    model.to(device)
-    model.eval()
-    return model, device
+        return model, device
+        
+    except Exception as e:
+        st.error(f"Error loading model: {e}")
+        return None, None
 
-def predict(model, device, image):
-    """Runs the inference logic with safety thresholds."""
-    # Preprocessing (Same as validation)
+
+def preprocess_image(image):
+    """Prepare image for model inference."""
     transform = transforms.Compose([
         transforms.Resize((384, 384)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], 
+            std=[0.229, 0.224, 0.225]
+        ),
     ])
-    
-    img_t = transform(image).unsqueeze(0).to(device)
+    return transform(image).unsqueeze(0)
+
+
+def analyze_image(model, device, image):
+    """Run inference and apply safety logic."""
+    img_tensor = preprocess_image(image).to(device)
     
     with torch.no_grad():
-        outputs = model(img_t)
-        probs = F.softmax(outputs, dim=1)[0].cpu().numpy()
-        
-    results = {name: float(p) for name, p in zip(CLASS_NAMES, probs)}
+        outputs = model(img_tensor)
+        probabilities = F.softmax(outputs, dim=1)[0].cpu().numpy()
     
-    # --- SAFETY LOGIC ---
+    # Create results dictionary
+    results = {name: float(prob) for name, prob in zip(CLASS_NAMES, probabilities)}
     
-    # Priority 1: Melanoma Check
-    if results['mel'] >= THRESHOLDS['mel']:
+    # Safety check: Melanoma
+    if results['mel'] >= SAFETY_THRESHOLDS['mel']:
         return {
-            "diagnosis": "Melanoma (High Risk)",
+            "prediction": "mel",
+            "diagnosis": FRIENDLY_NAMES['mel'],
             "risk": "HIGH",
             "probabilities": results,
-            "reason": f"Melanoma probability ({results['mel']:.1%}) exceeds safety threshold ({THRESHOLDS['mel']:.1%})"
+            "flagged": True,
+            "flag_reason": f"Melanoma probability ({results['mel']:.1%}) exceeds safety threshold ({SAFETY_THRESHOLDS['mel']:.1%})"
         }
-        
-    # Priority 2: SCC Check
-    if results['scc'] >= THRESHOLDS['scc']:
+    
+    # Safety check: Squamous Cell Carcinoma
+    if results['scc'] >= SAFETY_THRESHOLDS['scc']:
         return {
-            "diagnosis": "Squamous Cell Carcinoma (Risk)",
+            "prediction": "scc",
+            "diagnosis": FRIENDLY_NAMES['scc'],
             "risk": "HIGH",
             "probabilities": results,
-            "reason": f"SCC probability ({results['scc']:.4%}) exceeds safety threshold ({THRESHOLDS['scc']:.4%})"
+            "flagged": True,
+            "flag_reason": f"SCC probability ({results['scc']:.4%}) exceeds safety threshold ({SAFETY_THRESHOLDS['scc']:.4%})"
         }
-
-    # Priority 3: Standard Winner
-    winner_idx = probs.argmax()
-    winner_class = CLASS_NAMES[winner_idx]
     
-    # Map to friendly names
-    friendly_names = {
-        'nv': 'Melanocytic Nevus (Common Mole)',
-        'bkl': 'Benign Keratosis',
-        'bcc': 'Basal Cell Carcinoma',
-        'vasc': 'Vascular Lesion',
-        'df': 'Dermatofibroma',
-        'akiec': 'Actinic Keratosis',
-        'mel': 'Melanoma',
-        'scc': 'Squamous Cell Carcinoma'
-    }
+    # Standard prediction: highest probability class
+    top_class = CLASS_NAMES[probabilities.argmax()]
     
-    diagnosis = friendly_names.get(winner_class, winner_class.upper())
-    
-    if winner_class in ['bcc', 'akiec']:
-        risk = "Medium"
-    else:
-        risk = "Low"
-        
     return {
-        "diagnosis": diagnosis,
-        "risk": risk,
+        "prediction": top_class,
+        "diagnosis": FRIENDLY_NAMES[top_class],
+        "risk": RISK_CATEGORIES[top_class],
         "probabilities": results,
-        "reason": "Most likely classification"
+        "flagged": False,
+        "flag_reason": None
     }
 
-# --- APP UI ---
-st.set_page_config(page_title="DermScan AI", page_icon="🩺")
 
-st.title("🩺 DermScan AI: Professional Skin Lesion Analysis")
+def display_risk_badge(risk_level):
+    """Display a colored risk indicator."""
+    if risk_level == "HIGH":
+        st.error(f"⚠️ **Risk Level: {risk_level}** - Urgent dermatologist review recommended")
+    elif risk_level == "MEDIUM":
+        st.warning(f"🔸 **Risk Level: {risk_level}** - Dermatologist consultation advised")
+    else:
+        st.success(f"✅ **Risk Level: {risk_level}** - Likely benign, monitor for changes")
+
+
+def display_probabilities(probabilities):
+    """Display class probabilities as a bar chart."""
+    # Sort by probability (descending)
+    sorted_probs = sorted(probabilities.items(), key=lambda x: x[1], reverse=True)
+    
+    for class_name, prob in sorted_probs:
+        friendly_name = FRIENDLY_NAMES[class_name]
+        risk = RISK_CATEGORIES[class_name]
+        
+        # Color coding based on risk
+        if risk == "HIGH":
+            bar_color = "🔴"
+        elif risk == "MEDIUM":
+            bar_color = "🟠"
+        else:
+            bar_color = "🟢"
+        
+        # Create visual bar
+        bar_length = int(prob * 30)
+        bar = "█" * bar_length + "░" * (30 - bar_length)
+        
+        st.text(f"{bar_color} {class_name.upper():5} │{bar}│ {prob:6.2%}  {friendly_name}")
+
+
+# --- STREAMLIT APP ---
+st.set_page_config(
+    page_title="DermScan AI",
+    page_icon="🩺",
+    layout="centered"
+)
+
+st.title("🩺 DermScan AI")
+st.subheader("Professional Skin Lesion Analysis")
+
 st.markdown("""
-**Medical Safety Notice:** This tool uses an AI model calibrated for **High Sensitivity (97% Recall)**. 
-It is designed to flag *potential* risks for professional review. It is not a replacement for a doctor.
+---
+**⚕️ Medical Disclaimer**  
+This AI tool is designed for **screening purposes only** and is calibrated for high sensitivity 
+(97% recall for melanoma detection). It is **not a substitute for professional medical diagnosis**. 
+Always consult a qualified dermatologist for clinical evaluation.
+
+**Training Data:** HAM10000 & ISIC2019 datasets  
+**Classifications:** 8 lesion types including melanoma, BCC, SCC, and benign conditions
 """)
 
-# Load Model Logic
-# 1. Download model (if necessary)
-model_path = download_model(MODEL_URL, LOCAL_MODEL_PATH)
-# 2. Load model (into cache)
-model, device = load_model(model_path)
+st.divider()
 
-# File Uploader
-uploaded_file = st.file_uploader("Upload a dermoscopic image", type=["jpg", "png", "jpeg"])
+# Load model
+model, device = load_model()
+
+if model is None:
+    st.error("❌ Model failed to load. Please refresh the page or check the model URL.")
+    st.stop()
+
+st.success("✅ AI model loaded and ready", icon="🤖")
+
+# File upload
+uploaded_file = st.file_uploader(
+    "Upload a dermoscopic image",
+    type=["jpg", "jpeg", "png"],
+    help="For best results, use a high-quality dermoscopic image"
+)
 
 if uploaded_file is not None:
-    # Display Image
+    # Load and display image
     image = Image.open(uploaded_file).convert('RGB')
-    st.image(image, caption="Analyzed Image", use_column_width=True)
     
-    with st.spinner("Analyzing..."):
-        result = predict(model, device, image)
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.image(image, caption="Uploaded Image", use_container_width=True)
+    
+    # Run analysis
+    with st.spinner("🔬 Analyzing image..."):
+        result = analyze_image(model, device, image)
+    
+    with col2:
+        st.markdown("### Analysis Result")
         
+        # Risk badge
+        display_risk_badge(result["risk"])
+        
+        # Diagnosis
+        st.markdown(f"**Prediction:** {result['diagnosis']}")
+        
+        # Confidence
+        confidence = result["probabilities"][result["prediction"]]
+        st.markdown(f"**Confidence:** {confidence:.1%}")
+        
+        # Safety flag note
+        if result["flagged"]:
+            st.warning(f"🚨 **Safety Flag:** {result['flag_reason']}")
+    
     st.divider()
     
-    # Display Badge
-    if result["risk"] == "HIGH":
-        st.error(f"⚠️ RISK LEVEL: {result['risk']}")
-    elif result["risk"] == "Medium":
-        st.warning(f"🔸 RISK LEVEL: {result['risk']}")
-    else:
-        st.success(f"💚 RISK LEVEL: {result['risk']}")
-        
-    st.subheader(f"Diagnosis: {result['diagnosis']}")
-    st.info(f"Analysis: {result['reason']}")
+    # Detailed probabilities
+    with st.expander("📊 View All Class Probabilities"):
+        display_probabilities(result["probabilities"])
     
-    with st.expander("View Detailed Probabilities"):
-        # Sort and display
-        sorted_probs = dict(sorted(result['probabilities'].items(), key=lambda item: item[1], reverse=True))
-        for cls, prob in sorted_probs.items():
-            st.progress(prob, text=f"{cls}: {prob:.2%}")
+    # Recommendations based on risk
+    with st.expander("📋 Recommended Actions"):
+        if result["risk"] == "HIGH":
+            st.markdown("""
+            **Urgent Actions:**
+            - Schedule an appointment with a dermatologist as soon as possible
+            - Do not attempt to treat or remove the lesion yourself
+            - Document any changes in size, color, or shape
+            - Bring this analysis to your appointment for reference
+            """)
+        elif result["risk"] == "MEDIUM":
+            st.markdown("""
+            **Recommended Actions:**
+            - Schedule a dermatologist consultation within 2-4 weeks
+            - Monitor the lesion for any changes
+            - Take photos to track progression
+            - Note any symptoms like itching, bleeding, or pain
+            """)
+        else:
+            st.markdown("""
+            **General Guidance:**
+            - Continue regular skin self-examinations
+            - Monitor for changes using the ABCDE criteria
+            - Annual skin checks with a dermatologist are recommended
+            - Protect skin from excessive sun exposure
+            """)
+
+st.divider()
+st.caption("DermScan AI v1.0 | For research and screening purposes only | © 2024")
